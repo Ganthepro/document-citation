@@ -1,113 +1,137 @@
-"""LangGraph single-node graph template.
-
-Returns a predefined response. Replace logic and configuration as needed.
-"""
-
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any, Dict, TypedDict
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-import json
-from langchain_core.messages import AIMessage
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import AIMessage, HumanMessage
+from agent.state import InputState, OutputState, ConversationState
+from agent.utils import vector_store_setup
+from langgraph.graph.message import RemoveMessage, add_messages
+from agent.configuration import Configuration
+from typing import Literal
 
-# from openai import OpenAI
-from openai import OpenAI
+vector_store = vector_store_setup()
 
-embeddings = OpenAIEmbeddings()
-client = OpenAI()
 
-vector_store = client.vector_stores.create(
-    name="knowledge_base"
-)
+async def summarize_conversation(
+    state: ConversationState, config: RunnableConfig
+) -> dict:
+    """Summarize the conversation and return the summary."""
 
-# Clear the vector store
-file_list = client.files.list()
-for file in file_list:
-    client.files.delete(
-        file_id=file.id,
+    summary = state.get("summary", "")
+    # Create our summarization prompt
+    if summary:
+        # A summary already exists
+        summary_message = (
+            f"This is a summary of the conversation to date: {summary}\n\n"
+            "Extend the summary by taking into account the new messages above:"
+        )
+
+    else:
+        summary_message = "Create a summary of the conversation above:"
+
+    configuration = config["configurable"]
+    llm = ChatOpenAI(model=configuration.get("model_name", "gpt-4o-mini"))
+
+    # Add prompt to our history
+    messages = state["messages"] + [HumanMessage(content=summary_message)]
+    response = await llm.ainvoke(messages)
+
+    # Delete all but the 2 most recent messages
+    delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-2]]
+    return {"summary": response.content, "messages": delete_messages}
+
+
+async def call_model_with_memory(
+    conversation_state: ConversationState,
+    config: RunnableConfig,
+) -> ConversationState:
+    """Process input with memory and returns output."""
+    configuration = config["configurable"]
+    llm = ChatOpenAI(model=configuration.get("model_name", "gpt-4o-mini"))
+
+    openai_vector_store_ids = [
+        vector_store.id,
+    ]
+
+    tool = {
+        "type": "file_search",
+        "vector_store_ids": openai_vector_store_ids,
+    }
+    llm_with_tools = llm.bind_tools([tool])
+
+    # Add the current input to the chat history
+    current_message = HumanMessage(content=conversation_state["user_input"])
+    summary_message = AIMessage(
+        content=conversation_state.get("summary", "")
     )
 
-try:
-    with open("data/deep_research_blog.pdf", "rb") as file_content:
-        result = client.files.create(
-            file=file_content,
-            purpose="assistants"
+    # Create the message list with history and current message
+    print("Conversation state messages:", conversation_state["messages"])
+    messages = conversation_state["messages"] + [current_message] + [summary_message]
+
+    # Get the response from the model with tools and history
+    response = await llm_with_tools.ainvoke(messages)
+
+    # Extract the response text and annotations
+    response_text = response.text()
+    annotations = (
+        response.content[0].get("annotations", None) if response.content else None
+    )
+
+    # Create an AI message from the response
+    ai_message = AIMessage(content=response_text)
+
+    return ConversationState(
+        messages=add_messages(
+            conversation_state["messages"],
+            [current_message, ai_message],
+        ),
+        user_input=conversation_state["user_input"],
+        response=response_text,
+        annotations=annotations,
+    )
+
+
+def is_summary_needed(
+    conversation_state: ConversationState,
+    config: RunnableConfig,
+) -> Literal["summary", "__end__"]:
+    """Determine if a summary is needed based on the conversation state."""
+
+    # Check if the summary is empty or if the conversation has reached a certain length
+    if len(conversation_state["messages"]) > 5:
+        return "summary"
+    return "__end__"
+
+
+def create_graph():
+    """Create the graph with memory capability."""
+    graph = (
+        StateGraph(
+            ConversationState,
+            input=InputState,
+            output=OutputState,
+            config_schema=Configuration,
         )
-        client.vector_stores.files.create(
-            vector_store_id=vector_store.id,
-            file_id=result.id,
+        .add_node("call_model", call_model_with_memory)
+        .add_node("summarize_conversation", summarize_conversation)
+        .add_edge(START, "call_model")
+        .add_conditional_edges(
+            "call_model",
+            is_summary_needed,
+            {
+                "summary": "summarize_conversation",
+                "__end__": END,
+            },
         )
-    
-except OSError as e:
-    print("Error uploading file:", e)
+        .add_edge("summarize_conversation", END)
+        # .add_edge("summarize_conversation", "call_model")
+        
+    )
 
-class Configuration(TypedDict):
-    """Configurable parameters for the agent.
-
-    Set these when creating assistants OR when invoking the graph.
-    See: https://langchain-ai.github.io/langgraph/cloud/how-tos/configuration_cloud/
-    """
-
-    my_configurable_param: str
+    return graph.compile(name="Document Citation Agent With Memory")
 
 
-@dataclass
-class State:
-    """Input state for the agent.
-
-    Defines the initial structure of incoming data.
-    See: https://langchain-ai.github.io/langgraph/concepts/low_level/#state
-    """
-
-    user_input: str
-
-@dataclass
-class StateOutput:
-    """Output state for the agent.
-
-    Defines the structure of outgoing data.
-    See: https://langchain-ai.github.io/langgraph/concepts/low_level/#state
-    """
-
-    response: str
-    annotations: dict[str, Any]
-
-llm = ChatOpenAI(model="gpt-4o-mini")
-
-openai_vector_store_ids = [
-    vector_store.id,
-]
-
-tool = {
-    "type": "file_search",
-    "vector_store_ids": openai_vector_store_ids,
-}
-llm_with_tools = llm.bind_tools([tool])
-
-async def call_model(state: State, config: RunnableConfig) -> Dict[str, Any]:
-    """Process input and returns output.
-
-    Can use runtime configuration to alter behavior.
-    """
-    configuration = config["configurable"]
-
-    response = await llm_with_tools.ainvoke(state.user_input)
-    
-    return {
-        "response": response.text(),
-        "annotations": response.content[0]["annotations"][0],
-    }
-
-
-# Define the graph
-graph = (
-    StateGraph(input=State, config_schema=Configuration, output=StateOutput)
-    .add_node(call_model)
-    .add_edge(START, "call_model")
-    .add_edge("call_model", END)
-    .compile(name="New Graph")
-)
+# Create the graph
+graph = create_graph()
