@@ -42,6 +42,16 @@ async def summarize_conversation(
     return {"summary": response.content, "messages": delete_messages}
 
 
+openai_vector_store_ids = [
+    vector_store.id,
+]
+tool = {
+    "type": "file_search",
+    "vector_store_ids": openai_vector_store_ids,
+}
+tools = [tool]
+
+
 async def call_model_with_memory(
     conversation_state: ConversationState,
     config: RunnableConfig,
@@ -50,24 +60,13 @@ async def call_model_with_memory(
     configuration = config["configurable"]
     llm = ChatOpenAI(model=configuration.get("model_name", "gpt-4o-mini"))
 
-    openai_vector_store_ids = [
-        vector_store.id,
-    ]
-
-    tool = {
-        "type": "file_search",
-        "vector_store_ids": openai_vector_store_ids,
-    }
-    llm_with_tools = llm.bind_tools([tool])
+    llm_with_tools = llm.bind_tools(tools)
 
     # Add the current input to the chat history
     current_message = HumanMessage(content=conversation_state["user_input"])
-    summary_message = AIMessage(
-        content=conversation_state.get("summary", "")
-    )
+    summary_message = AIMessage(content=conversation_state.get("summary", ""))
 
     # Create the message list with history and current message
-    print("Conversation state messages:", conversation_state["messages"])
     messages = conversation_state["messages"] + [current_message] + [summary_message]
 
     # Get the response from the model with tools and history
@@ -107,6 +106,8 @@ def is_summary_needed(
 
 def create_graph():
     """Create the graph with memory capability."""
+
+    # Define the graph with memory capability
     graph = (
         StateGraph(
             ConversationState,
@@ -126,11 +127,9 @@ def create_graph():
             },
         )
         .add_edge("summarize_conversation", END)
-        # .add_edge("summarize_conversation", "call_model")
-        
     )
 
-    return graph.compile(name="Document Citation Agent With Memory")
+    return graph.compile(name="Document Citation Agent")
 
 
 # Create the graph
