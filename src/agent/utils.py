@@ -1,29 +1,55 @@
 import os
 from openai.types import VectorStore
 from openai import OpenAI
+from openai.types.file_object import FileObject
+from supabase import create_client
 
 client = OpenAI()
+
+class Storage:
+    def __init__(self):
+        self.__supabase = create_client(
+            supabase_key=os.getenv("SUPABASE_KEY"),
+            supabase_url=os.getenv("SUPABASE_URL"),
+        )
+
+    def create_bucket(self, bucket_name: str):
+        return self.__supabase.storage.create_bucket(bucket_name)
+
+    def get_bucket(self, bucket_name: str):
+        return self.__supabase.storage.get_bucket(bucket_name)
+
+    def list_buckets(self):
+        return self.__supabase.storage.list_buckets()
+
+    def list_files(self, bucket_name: str):
+        return self.__supabase.storage.from_(bucket_name).list()
+    
+    def upload_file(self, bucket_name: str, folder_path: str):
+        for file in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, file)
+            if os.path.isfile(file_path):
+                with open(file_path, "rb") as f:    
+                    self.__supabase.storage.from_(bucket_name).upload(file, f)
+    
 
 
 def vector_store_setup() -> VectorStore:
     existed_vs = client.vector_stores.list()
-    filtered_vs = [
-        vs for vs in existed_vs if vs.name == "knowledge_base"
-    ]
+    filtered_vs = [vs for vs in existed_vs if vs.name == "knowledge_base"]
+
+    file_list = client.files.list()
 
     # Remove all files from the vector store
-    for vs in filtered_vs:
-        files = client.vector_stores.files.list(vector_store_id=vs.id)
-        for file in files:
-            client.vector_stores.files.delete(
-                vector_store_id=vs.id,
-                file_id=file.id,
-            )
-    
+    for file in file_list:
+        client.files.delete(
+            file_id=file.id,
+        )
+
     # Remove all vector stores with the name "knowledge_base"
     for vs in filtered_vs:
         client.vector_stores.delete(
-            vector_store_id=vs.id,    
+            vector_store_id=vs.id,
         )
 
     # Create a new vector store
@@ -48,3 +74,8 @@ def vector_store_setup() -> VectorStore:
     except Exception as e:
         raise FileNotFoundError(f"File not found: {e}") from e
     return vector_store
+
+
+def retrieve_files(file_id: str) -> FileObject:
+    file = client.files.retrieve(file_id=file_id)
+    return file
